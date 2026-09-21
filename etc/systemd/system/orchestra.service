@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Orchestra Discord Bot Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/AIOrchestra
+ExecStart=/home/ubuntu/AIOrchestra/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/ubuntu/AIOrchestra/.env
+
+[Install]
+WantedBy=multi-user.target
