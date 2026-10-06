@@ -5,7 +5,7 @@ import discord
 from discord.ext import commands
 from discord.ui import Button, View
 from dotenv import load_dotenv
-from agent_graph import agent_app
+from agent_graph import agent_app, pool
 from langgraph.types import Command
 
 load_dotenv()
@@ -16,17 +16,36 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-def run_agent_start(task_text: str, thread_id: str):
+def run_agent_start(task_text, thread_id):
     thread_config = {"configurable": {"thread_id": thread_id}}
+
+    # Health check pool before starting graph streaming
+    try:
+        with pool.connection() as conn:
+            conn.execute("SELECT 1")
+    except Exception as e:
+        print(f"[Database] Pool connection check failed, reconnecting: {e}")
+        pool.open()
+
     for _ in agent_app.stream({"task": task_text, "thread_id": thread_id}, thread_config):
         pass
+
     return agent_app.get_state(thread_config)
 
 def run_agent_resume(thread_id: str, approved: bool):
     """Resumes the graph using persisted state until completion or the next interrupt."""
     thread_config = {"configurable": {"thread_id": thread_id}}
+
+    try:
+        with pool.connection() as conn:
+            conn.execute("SELECT 1")
+    except Exception as e:
+        print(f"[Database] Pool connection check failed during resume: {e}")
+        pool.open()
+
     for _ in agent_app.stream(Command(resume={"approved": approved}), thread_config):
         pass
+
     return agent_app.get_state(thread_config)
 
 class TaskApprovalView(View):

@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import time
+import random
 import asyncio
 from typing import Literal, TypedDict
 from dotenv import load_dotenv
@@ -11,7 +13,7 @@ from psycopg_pool import ConnectionPool
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from linkedin_engine import search_and_prep_easy_apply, submit_confirmed_application
+from linkedin_engine import search_and_prep_easy_apply, submit_confirmed_application, extract_job_id
 from career_tools import fetch_job_details, load_user_profile, save_document_artifact
 
 load_dotenv()
@@ -46,6 +48,9 @@ def extract_text(content) -> str:
         return "".join(text_parts).strip()
     return str(content).strip()
 
+# NOTE: verify this model string is valid for your Gemini API access before relying
+# on it in production; the form-evaluator LLM elsewhere in the codebase pins to
+# "gemini-3.6-flash", so keep these in sync unless you specifically need a newer model.
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.6-flash",
     google_api_key=os.getenv("GEMINI_API_KEY")
@@ -66,7 +71,7 @@ def orchestrator(state: AgentState):
         SystemMessage(content=system_instruction),
         HumanMessage(content=user_task)
     ])
-    
+
     raw_content = extract_text(response.content)
     # Strip markdown code fencing if returned
     clean_json = re.sub(r"^```json\s*|\s*```$", "", raw_content, flags=re.MULTILINE).strip()
@@ -78,6 +83,9 @@ def orchestrator(state: AgentState):
     except Exception:
         worker = "career_worker" if any(k in state["task"].lower() for k in ["apply", "job", "linkedin"]) else "dev_worker"
         target_count = 1
+
+    # Guard against a nonsensical or runaway count from a bad LLM parse
+    target_count = max(1, min(target_count, 20))
 
     return {
         "target_worker": worker,
@@ -110,6 +118,13 @@ def career_worker(state: AgentState):
         already_applied = state.get("applied_job_ids", [])
         current_step = state.get("completed_count", 0) + 1
         total_steps = state.get("target_count", 1)
+
+        # Small randomized pacing delay between batch items (skipped on the first
+        # item in a batch, since there's nothing to space out from yet).
+        if current_step > 1:
+            pause = random.uniform(8, 20)
+            print(f"[Career Worker] Pausing {pause:.1f}s before starting job {current_step}/{total_steps}...")
+            time.sleep(pause)
 
         print(f"\n[Career Worker] Processing job {current_step}/{total_steps} for keyword: '{role_target}'")
         print(f"[Career Worker] Excluding already applied IDs: {already_applied}")
@@ -180,19 +195,21 @@ def route_approval(state: AgentState) -> Literal["execute_action", "handle_rejec
 
 def execute_action(state: AgentState):
     worker = state.get("target_worker")
-    
+
     if worker == "career_worker":
         if state.get("action_type") == "job_application":
             job_url = state.get("job_url", "")
             company = state.get("company", "Company")
-            
+
             sub_res = asyncio.run(submit_confirmed_application(job_url, company))
-            
-            # Extract job_id from current url to avoid applying to it again in this run
+
+            # Extract job_id from current url to avoid applying to it again in this run.
+            # Uses the shared extract_job_id helper so this stays in sync with the
+            # patterns linkedin_engine.py knows about, instead of a separate regex here.
             applied_ids = list(state.get("applied_job_ids", []))
-            id_match = re.search(r"currentJobId=(\d+)", job_url) or re.search(r"view/(\d+)", job_url)
-            if id_match:
-                applied_ids.append(id_match.group(1))
+            job_id = extract_job_id(job_url)
+            if job_id and job_id not in applied_ids:
+                applied_ids.append(job_id)
 
             new_completed = state.get("completed_count", 0) + 1
 
@@ -216,11 +233,11 @@ def route_next_step(state: AgentState) -> Literal["career_worker", "__end__"]:
     if state.get("action_type") == "job_application":
         completed = state.get("completed_count", 0)
         target = state.get("target_count", 1)
-        
+
         if completed < target:
             print(f"[Orchestrator] Batch Progress: {completed}/{target} complete. Routing to next application.")
             return "career_worker"
-        
+
         print(f"[Orchestrator] Batch completed: {completed}/{target} applications finished.")
         return END
 
@@ -256,6 +273,9 @@ DB_URI = os.getenv("DATABASE_URL")
 pool = ConnectionPool(
     conninfo=DB_URI,
     max_size=10,
+    max_idle=300,            # Close connections idle > 5 minutes
+    max_lifetime=1800,        # Force recycle connections older than 30 minutes
+    reconnect_failed=True,    # Auto-reconnect if connection is dead/dropped
     kwargs={
         "autocommit": True,
         "keepalives": 1,
