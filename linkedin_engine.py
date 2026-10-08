@@ -1,9 +1,85 @@
 import asyncio
 import os
 import re
+import json
+import random
 from urllib.parse import quote
 from playwright.async_api import async_playwright
-from career_tools import load_user_profile
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage
+
+# ==============================================================================
+# PROFILE LOADER & MAPPER
+# ==============================================================================
+def load_user_profile_data() -> dict:
+    """Loads the user profile JSON data."""
+    profile_path = os.path.abspath("user_profile.json")
+    if os.path.exists(profile_path):
+        try:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[LinkedIn Engine] Error reading user_profile.json: {e}")
+    return {}
+
+def get_profile_context_summary() -> str:
+    """Formats user_profile.json into a concise text blob for LLM context."""
+    p = load_user_profile_data()
+    if not p:
+        return ""
+    return json.dumps(p, indent=2)
+
+# Dynamic mapping derived directly from user_profile.json
+def get_field_maps():
+    p = load_user_profile_data()
+    legal = p.get("legal_and_work_authorization", {})
+    eeo = p.get("eeo_demographics", {})
+    edu = p.get("education", {})
+    
+    return {
+        # Legal & Work Auth
+        "sponsorship": legal.get("requires_sponsorship", "No"),
+        "require sponsorship": legal.get("requires_sponsorship", "No"),
+        "future sponsorship": legal.get("future_sponsorship", "No"),
+        "authorized to work": legal.get("authorized_in_us", "Yes"),
+        "legally authorized": legal.get("authorized_in_us", "Yes"),
+        "legal right to work": legal.get("authorized_in_us", "Yes"),
+        "18 years of age": legal.get("at_least_18", "Yes"),
+        "at least 18": legal.get("at_least_18", "Yes"),
+        
+        # EEO Demographics
+        "gender": eeo.get("gender", "Male"),
+        "race": eeo.get("race_ethnicity", "Hispanic or Latino"),
+        "ethnicity": eeo.get("race_ethnicity", "Hispanic or Latino"),
+        "veteran": eeo.get("veteran_status", "No"),
+        "disability": eeo.get("disability_status", "No"),
+        
+        # Education
+        "bachelor": "Yes" if "bachelor" in edu.get("highest_degree", "").lower() else "No",
+        "master": "Yes" if "master" in edu.get("highest_degree", "").lower() else "No",
+        "degree": edu.get("highest_degree", "Bachelor's Degree"),
+        "gpa": edu.get("gpa", "3.72")
+    }
+
+# ==============================================================================
+# SHARED HELPER: JOB ID EXTRACTION
+# ==============================================================================
+JOB_ID_PATTERNS = [
+    r"currentJobId=(\d+)",
+    r"/jobs/view/(\d+)",
+    r"view/(\d+)",
+    r"[?&]jobId=(\d+)",
+]
+
+def extract_job_id(url_or_attr: str) -> str | None:
+    """Tries multiple known LinkedIn URL/attribute shapes to pull a job id."""
+    if not url_or_attr:
+        return None
+    for pattern in JOB_ID_PATTERNS:
+        match = re.search(pattern, url_or_attr)
+        if match:
+            return match.group(1)
+    return None
 
 async def handle_security_challenges(page, state_file: str, return_url: str = None) -> bool:
     """Detects and resolves inline password confirmation prompts."""
@@ -17,19 +93,16 @@ async def handle_security_challenges(page, state_file: str, return_url: str = No
             print("[LinkedIn Engine] Error: LINKEDIN_PASSWORD is not set in environment.")
             return False
 
-        # Ensure field is interactive and fully cleared
         await pwd_input.click()
         await asyncio.sleep(0.5)
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Backspace")
         await asyncio.sleep(0.3)
 
-        # Type using simulated hardware events
         for char in linkedin_pwd:
             await page.keyboard.type(char, delay=65)
         await asyncio.sleep(1)
 
-        # Dispatch DOM input events for reactive forms
         await pwd_input.dispatch_event("input")
         await pwd_input.dispatch_event("change")
         await asyncio.sleep(0.5)
@@ -42,7 +115,6 @@ async def handle_security_challenges(page, state_file: str, return_url: str = No
 
         print("[LinkedIn Engine] Password submitted. Waiting for checkpoint resolution...")
 
-        # Wait for the password modal to disappear
         try:
             await pwd_input.wait_for(state="hidden", timeout=15000)
             print("[LinkedIn Engine] Checkpoint modal cleared.")
@@ -51,12 +123,9 @@ async def handle_security_challenges(page, state_file: str, return_url: str = No
             await page.screenshot(path="checkpoint_submit_failed.png")
 
         await asyncio.sleep(6)
-
-        # Persist updated session tokens immediately
         await page.context.storage_state(path=state_file)
         print("[LinkedIn Engine] Authenticated state updated after challenge.")
 
-        # Re-navigate to the desired target URL if provided
         if return_url:
             print(f"[LinkedIn Engine] Navigating back to target URL: {return_url}")
             await page.goto(return_url, wait_until="domcontentloaded")
@@ -66,49 +135,141 @@ async def handle_security_challenges(page, state_file: str, return_url: str = No
     return False
 
 # ==============================================================================
-# COMMON FORM FILLING UTILITIES
+# TOKEN EFFICIENT FORM EVALUATION & HEURISTICS
 # ==============================================================================
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage
-
-# Fast LLM instance for immediate form evaluations
 llm_evaluator = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+    model="gemini-3.8-flash",
     google_api_key=os.getenv("GEMINI_API_KEY")
 )
 
+def is_local_to_location(question_text: str, user_location: dict) -> bool:
+    """Checks if a location in the question matches user's actual profile location."""
+    q_lower = question_text.lower()
+    user_city = user_location.get("city", "").lower()
+    user_state = user_location.get("state", "").lower()
+
+    # Common location/relocation/onsite keywords
+    location_keywords = ["local to", "located in", "commute to", "live in", "near", "relocate to", "in-person", "in house", "onsite"]
+    
+    if any(kw in q_lower for kw in location_keywords):
+        # If user's city/state isn't in the question text, they aren't local
+        if user_city and user_city not in q_lower:
+            return False
+        if user_state and user_state not in q_lower:
+            return False
+    return True
+
+def evaluate_choice_heuristically(question: str, options: list[str]) -> str | None:
+    """Intercepts common questions locally using user_profile.json mapped values with strict matching."""
+    q_lower = question.lower()
+    p = load_user_profile_data()
+    user_loc = p.get("location", {})
+    legal = p.get("legal_and_work_authorization", {})
+    eeo = p.get("eeo_demographics", {})
+    edu = p.get("education", {})
+
+    # 1. Check Location / On-site / Commute requirement
+    if any(kw in q_lower for kw in ["local to", "located in", "commute", "live in", "onsite", "in house", "in-house"]):
+        user_city = user_loc.get("city", "").lower()
+        user_state = user_loc.get("state", "").lower()
+        
+        # If specific city/state asked in question doesn't match candidate's location
+        if (user_city and user_city not in q_lower) or (user_state and user_state not in q_lower):
+            for opt in options:
+                if opt.lower() in ["no", "false"]:
+                    return opt
+            return "No"
+
+    # 2. Strict Exact Keyword Mapping (Word boundaries prevent partial string overlaps)
+    strict_mappings = [
+        (r"\brequire.*sponsorship\b|\bsponsor\b", legal.get("requires_sponsorship", "No")),
+        (r"\bfuture.*sponsorship\b", legal.get("future_sponsorship", "No")),
+        (r"\bauthorized\b|\blegal right\b", legal.get("authorized_in_us", "Yes")),
+        (r"\b18 years\b|\bat least 18\b", legal.get("at_least_18", "Yes")),
+        (r"\bgender\b", eeo.get("gender", "Male")),
+        (r"\brace\b|\bethnicity\b", eeo.get("race_ethnicity", "Hispanic or Latino")),
+        (r"\bveteran\b", eeo.get("veteran_status", "No")),
+        (r"\bdisability\b", eeo.get("disability_status", "No")),
+    ]
+
+    for regex_pattern, preferred_val in strict_mappings:
+        if re.search(regex_pattern, q_lower):
+            if options:
+                for opt in options:
+                    if preferred_val.lower() == opt.lower() or preferred_val.lower() in opt.lower():
+                        return opt
+            return preferred_val
+
+    return None
+
+def extract_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+            elif isinstance(part, dict) and "text" in part:
+                text_parts.append(part["text"])
+        return "".join(text_parts).strip()
+    return str(content).strip()
+
 def evaluate_form_choice(question: str, options: list[str], profile_text: str) -> str:
-    """Uses LLM to evaluate the most accurate answer given the user's profile."""
-    system_prompt = (
-        "You are an assistant answering job application questions truthfully on behalf of a candidate.\n"
-        "Analyze the question, the available multiple-choice options, and the candidate's profile.\n"
-        "- If the question asks whether the candidate lives in a list of states/locations (e.g. TX, TN, FL, LA, OH) and the candidate does not reside in those locations, choose 'No'.\n"
-        "- If the question asks about professional/production experience with a specific tool (e.g., Kubernetes in production) and it is absent from the profile, choose 'No'.\n"
-        "- Output ONLY the exact text of the best matching option from the provided options list."
-    )
-    user_prompt = (
-        f"Candidate Profile:\n{profile_text}\n\n"
-        f"Question: {question}\n"
-        f"Available Options: {json.dumps(options)}\n\n"
-        "Chosen Option:"
-    )
+    """Evaluates option choice using local heuristics first, then Gemini with safe fallback."""
+    if not options:
+        return ""
+
+def evaluate_form_choice(question: str, options: list[str], profile_text: str) -> str:
+    if not options:
+        return ""
+
+    # Primary Gemini evaluator
+    primary = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+    # Fallback Groq evaluator
+    fallback = ChatGroq(model_name="llama-3.1-8b-instant")
+    
+    llm_evaluator = primary.with_fallbacks([fallback])
+
     try:
-        res = llm_evaluator.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+        res = llm_evaluator.invoke([
+            SystemMessage(content=system_prompt), 
+            HumanMessage(content=user_prompt)
+        ])
         selected = res.content.strip().strip('"').strip("'")
-        return selected
-    except Exception:
-        return options[0] if options else ""
+        if selected in options:
+            return selected
+    except Exception as e:
+        print(f"[LinkedIn Engine] All LLMs failed: {e}")
+
+    # Fallback to local heuristic if both primary and fallback fail
+    return options[0]
+
+    # Safer Default: For binary Yes/No questions, default to "No" unless specifically matching profile
+    yn_no = next((o for o in options if o.lower() in ["no", "false"]), None)
+    if yn_no:
+        return yn_no
+
+    return options[0]
+
+def lookup_experience_years(question_label: str) -> str:
+    """Matches form question labels against skill keys in user_profile.json."""
+    profile = load_user_profile_data()
+    yoe_map = profile.get("years_of_experience", {})
+    q_lower = question_label.lower()
+
+    for skill, years in yoe_map.items():
+        if skill != "default" and skill in q_lower:
+            return str(years)
+    
+    return str(yoe_map.get("default", 0))
 
 async def answer_common_questions(page):
-    """Answers numeric, text, radio, native select, and LinkedIn combobox questions using profile context."""
-    profile_text = load_user_profile()
+    """Answers numeric, text, radio, native select, and LinkedIn combobox questions using user_profile.json context."""
+    profile_text = get_profile_context_summary()
+    profile = load_user_profile_data()
 
-    # Ensure we scroll the modal to expose form fields
-    modal_body = page.locator(".jobs-easy-apply-modal__content, div[role='dialog']").first
-
-    # --------------------------------------------------------------------------
-    # 1. LinkedIn Custom Dropdowns / Comboboxes (button or div with role='combobox')
-    # --------------------------------------------------------------------------
+    # 1. Comboboxes & Native Selects
     comboboxes = await page.locator("button[role='combobox'], div[role='combobox'], select").all()
     for cb in comboboxes:
         try:
@@ -117,12 +278,11 @@ async def answer_common_questions(page):
 
             tag_name = await cb.evaluate("el => el.tagName.toLowerCase()")
 
-            # Case A: Standard native <select>
             if tag_name == "select":
                 sel_id = await cb.get_attribute("id") or ""
                 label_elem = page.locator(f"label[for='{sel_id}']").first
                 q_text = await label_elem.inner_text() if await label_elem.count() else ""
-                
+
                 if not q_text:
                     wrapper = cb.locator("xpath=ancestor::div[contains(@class, 'jobs-easy-apply-form-element') or contains(@class, 'fb-dash-form-element')]").first
                     if await wrapper.count():
@@ -143,22 +303,17 @@ async def answer_common_questions(page):
                     await cb.dispatch_event("change")
                 continue
 
-            # Case B: LinkedIn Art Deco Custom Combobox (Button)
             cb_text = (await cb.inner_text()).strip()
-            # If already filled with an answer, skip
             if cb_text and "select an option" not in cb_text.lower():
                 continue
 
-            # Find the enclosing question text
             parent_container = cb.locator("xpath=ancestor::div[contains(@class, 'jobs-easy-apply-form-element') or contains(@class, 'fb-dash-form-element') or contains(@class, 'artdeco-dropdown')]").first
             q_elem = parent_container.locator("label, span.fb-dash-form-element__label, .artdeco-dropdown__label").first
             question_text = (await q_elem.inner_text()).strip() if await q_elem.count() else "Question"
 
-            # Click to expand the options menu
             await cb.click(force=True)
             await asyncio.sleep(0.6)
 
-            # Locate the opened dropdown options
             options_loc = page.locator("div[role='listbox'] div[role='option'], div.artdeco-dropdown__item, ul.dropdown-list li")
             opt_count = await options_loc.count()
 
@@ -174,8 +329,7 @@ async def answer_common_questions(page):
 
                 if opt_names:
                     chosen_text = evaluate_form_choice(question_text, opt_names, profile_text)
-                    
-                    # Click the matching option
+
                     selected_elem = None
                     for i, name in enumerate(opt_names):
                         if name.lower() == chosen_text.lower() or chosen_text.lower() in name.lower():
@@ -193,9 +347,7 @@ async def answer_common_questions(page):
             print(f"[LinkedIn Engine] Combobox error: {e}")
             continue
 
-    # --------------------------------------------------------------------------
-    # 2. Radio Groups (<fieldset>)
-    # --------------------------------------------------------------------------
+    # 2. Radio Groups
     fieldsets = await page.locator("fieldset:visible").all()
     for fs in fieldsets:
         try:
@@ -219,9 +371,7 @@ async def answer_common_questions(page):
         except Exception:
             continue
 
-    # --------------------------------------------------------------------------
-    # 3. Numeric & Text Inputs
-    # --------------------------------------------------------------------------
+    # 3. Numeric & Text Inputs populated dynamically from JSON
     text_inputs = await page.locator("input[type='text']:visible, input[type='number']:visible").all()
     for inp in text_inputs:
         try:
@@ -231,17 +381,74 @@ async def answer_common_questions(page):
                 inp_id = await inp.get_attribute("id") or ""
                 label_elem = page.locator(f"label[for='{inp_id}']").first
                 label_text = await label_elem.inner_text() if await label_elem.count() else ""
+                lbl_lower = label_text.lower()
 
-                if any(term in label_text.lower() for term in ["year", "experience", "how many"]):
-                    await inp.fill("2")
-                    await inp.dispatch_event("input")
-                    await inp.dispatch_event("change")
-                elif "gpa" in label_text.lower():
-                    await inp.fill("3.5")
+                fill_value = None
+                if any(term in lbl_lower for term in ["year", "experience", "how many"]):
+                    fill_value = lookup_experience_years(label_text)
+                elif "gpa" in lbl_lower:
+                    fill_value = profile.get("education", {}).get("gpa", "3.72")
+                elif "city" in lbl_lower:
+                    fill_value = profile.get("location", {}).get("city", "Atlanta")
+                elif "zip" in lbl_lower or "postal" in lbl_lower:
+                    fill_value = profile.get("location", {}).get("zip_code", "30043")
+
+                if fill_value:
+                    await inp.fill(fill_value)
                     await inp.dispatch_event("input")
                     await inp.dispatch_event("change")
         except Exception:
             continue
+
+async def attach_resume(page, resume_file: str = None) -> bool:
+    """Verifies that LinkedIn has pre-selected default resume or attaches file."""
+    resume_card = page.locator(
+        ".jobs-document-upload__file-name, "
+        "div[class*='jobs-document-upload'], "
+        "span:has-text('.pdf'), "
+        "span:has-text('.doc')"
+    ).first
+
+    if await resume_card.count() and await resume_card.is_visible():
+        card_text = await resume_card.inner_text()
+        print(f"[LinkedIn Engine] Default profile resume detected on application form: '{card_text.strip()}'")
+        return True
+
+    file_input = page.locator("input[type='file']").first
+    if await file_input.count():
+        if resume_file and os.path.exists(resume_file) and os.path.getsize(resume_file) > 0:
+            print(f"[LinkedIn Engine] File upload required. Attaching local file: {resume_file}")
+            await file_input.set_input_files(resume_file)
+            await file_input.dispatch_event("input")
+            await file_input.dispatch_event("change")
+            await asyncio.sleep(2)
+            return True
+
+    print("[LinkedIn Engine] No file upload required; proceeding with default account resume.")
+    return True
+
+TRACE_DIR = os.path.abspath("outputs/traces")
+
+def _trace_path(label: str) -> str:
+    os.makedirs(TRACE_DIR, exist_ok=True)
+    clean_label = re.sub(r'[^a-zA-Z0-9]', '_', label)[:60]
+    timestamp = asyncio.get_event_loop().time()
+    return os.path.join(TRACE_DIR, f"{clean_label}_{int(timestamp)}.zip")
+
+async def _finalize_session(context, browser, state_file: str, trace_path: str = None):
+    if trace_path:
+        try:
+            await context.tracing.stop(path=trace_path)
+            print(f"[LinkedIn Engine] Trace saved: {trace_path} (view with `playwright show-trace {trace_path}`)")
+        except Exception as e:
+            print(f"[LinkedIn Engine] Failed to save trace: {e}")
+
+    try:
+        await context.storage_state(path=state_file)
+    except Exception as e:
+        print(f"[LinkedIn Engine] Failed to persist session state: {e}")
+
+    await browser.close()
 
 # ==============================================================================
 # SUBMIT CONFIRMED APPLICATION WORKFLOW
@@ -249,6 +456,7 @@ async def answer_common_questions(page):
 async def submit_confirmed_application(job_url: str, company: str) -> dict:
     state_file = os.path.abspath("state.json")
     resume_file = os.path.abspath("resume.pdf")
+    trace_path = _trace_path(f"submit_{company}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -259,6 +467,7 @@ async def submit_confirmed_application(job_url: str, company: str) -> dict:
             storage_state=state_file if os.path.exists(state_file) else None,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         )
+        await context.tracing.start(screenshots=True, snapshots=True, sources=True)
         page = await context.new_page()
 
         clean_url = job_url.split("?")[0] if "currentJobId=" not in job_url else job_url
@@ -266,21 +475,17 @@ async def submit_confirmed_application(job_url: str, company: str) -> dict:
         await page.goto(clean_url, wait_until="domcontentloaded")
         await asyncio.sleep(5)
 
-        # Handle checkpoint if triggered
         await handle_security_challenges(page, state_file, return_url=clean_url)
 
-        # 1. Check if already submitted
         applied_badge = page.locator("span:has-text('Applied'), button:has-text('Applied')").first
         if await applied_badge.count() and await applied_badge.is_visible():
-            await context.storage_state(path=state_file)
-            await browser.close()
+            await _finalize_session(context, browser, state_file, trace_path)
             return {
                 "success": True,
                 "status": "Already submitted",
                 "confirmation_screenshot": ""
             }
 
-        # 2. Open the Easy Apply modal
         modal = page.locator("div[role='dialog'], .jobs-easy-apply-modal").first
         if not (await modal.count() and await modal.is_visible()):
             apply_candidates = [
@@ -311,30 +516,20 @@ async def submit_confirmed_application(job_url: str, company: str) -> dict:
                 os.makedirs("outputs/applications", exist_ok=True)
                 err_shot = os.path.abspath("outputs/applications/apply_button_missing.png")
                 await page.screenshot(path=err_shot)
-                await context.storage_state(path=state_file)
-                await browser.close()
+                await _finalize_session(context, browser, state_file, trace_path)
                 return {
                     "success": False,
                     "status": "Easy Apply button not accessible on resume.",
                     "confirmation_screenshot": err_shot
                 }
 
-        # 3. Step forward through modal to final submission
         for step in range(12):
             await asyncio.sleep(1.5)
 
-            # Auto-fill common inputs
             await answer_common_questions(page)
 
-            # Upload resume if prompted
-            file_input = page.locator("input[type='file']").first
-            if await file_input.count() and os.path.exists(resume_file):
-                try:
-                    await file_input.set_input_files(resume_file)
-                except Exception:
-                    pass
+            await attach_resume(page, resume_file)
 
-            # Scroll down the modal content to reveal action buttons
             modal_body = page.locator(".jobs-easy-apply-modal__content, div[role='dialog']").first
             if await modal_body.count():
                 try:
@@ -343,7 +538,6 @@ async def submit_confirmed_application(job_url: str, company: str) -> dict:
                     pass
                 await asyncio.sleep(0.5)
 
-            # Check for Submit application
             submit_btn = page.locator("button[aria-label='Submit application'], button:has-text('Submit application')").first
             if await submit_btn.count():
                 print("[LinkedIn Engine] Scrolling to and clicking 'Submit application'...")
@@ -353,7 +547,6 @@ async def submit_confirmed_application(job_url: str, company: str) -> dict:
                 await asyncio.sleep(5)
                 break
 
-            # Advance via Next or Review
             next_or_review = page.locator(
                 "button[aria-label='Review your application'], button[aria-label='Continue to next step'], button:has-text('Next'), button:has-text('Review')"
             ).first
@@ -364,20 +557,17 @@ async def submit_confirmed_application(job_url: str, company: str) -> dict:
             else:
                 break
 
-        # 4. Save proof screenshot of the completed submission modal
         os.makedirs("outputs/applications", exist_ok=True)
         clean_company = re.sub(r'[^a-zA-Z0-9]', '_', company)
         confirm_screenshot = os.path.abspath(f"outputs/applications/{clean_company}_CONFIRMED.png")
         await page.screenshot(path=confirm_screenshot)
 
-        # 5. Check confirmation indicators
         success_indicator = page.locator(
             "h3:has-text('Application submitted'), h2:has-text('Application submitted'), div:has-text('Your application was sent to'), span:has-text('Applied')"
         ).first
         is_confirmed = (await success_indicator.count() > 0) or (await page.locator("span:has-text('Applied')").count() > 0)
 
-        await context.storage_state(path=state_file)
-        await browser.close()
+        await _finalize_session(context, browser, state_file, trace_path)
 
         return {
             "success": is_confirmed,
@@ -391,43 +581,43 @@ async def submit_confirmed_application(job_url: str, company: str) -> dict:
 async def search_and_prep_easy_apply(role: str, location: str = "United States", excluded_ids: list = None) -> dict:
     if excluded_ids is None:
         excluded_ids = []
-        
+
     resume_file = os.path.abspath("resume.pdf")
 
     if not os.path.exists(resume_file):
         return {"error": f"resume.pdf not found at: {resume_file}. Add your PDF to the project root."}
 
     print(f"\n[LinkedIn Engine] Starting search for role: '{role}' in '{location}'...")
+    trace_path = _trace_path(f"search_{role}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--start-maximized"]
         )
-        
+
         state_file = os.path.abspath("state.json")
         context = await browser.new_context(
             storage_state=state_file if os.path.exists(state_file) else None,
             no_viewport=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         )
+        await context.tracing.start(screenshots=True, snapshots=True, sources=True)
         page = await context.new_page()
 
         encoded_role = quote(role)
         encoded_loc = quote(location)
         url = f"https://www.linkedin.com/jobs/search/?keywords={encoded_role}&location={encoded_loc}&f_AL=true"
-        
+
         print(f"[LinkedIn Engine] Navigating to: {url}")
         await page.goto(url, wait_until="domcontentloaded")
         await asyncio.sleep(4)
 
-        # Handle checkpoint if triggered
         handled = await handle_security_challenges(page, state_file, return_url=url)
         if not handled:
             await asyncio.sleep(2)
             await handle_security_challenges(page, state_file, return_url=url)
 
-        # Dismiss app modal if present
         try:
             dismiss_btn = page.locator("button[aria-label='Dismiss'], button.modal__dismiss, button[data-tracking-control-name='public_jobs_contextual-sign-in-modal_modal_dismiss']").first
             if await dismiss_btn.count() and await dismiss_btn.is_visible():
@@ -456,31 +646,27 @@ async def search_and_prep_easy_apply(role: str, location: str = "United States",
                 break
 
         if not cards:
-            await context.storage_state(path=state_file)
-            await browser.close()
+            await _finalize_session(context, browser, state_file, trace_path)
             return {"error": "No jobs found or page layout blocked. Verify search query and filters."}
 
         target_job = None
         for i, card in enumerate(cards[:10]):
             try:
-                # 1. Extract job ID first before opening or clicking
                 job_id_attr = await card.get_attribute("data-job-id")
                 if not job_id_attr:
                     card_link = card.locator("a[data-control-name='job_card_click'], a.job-card-list__title--link, a.job-card-container__link").first
                     href = await card_link.get_attribute("href") if await card_link.count() else ""
-                    match = re.search(r"view/(\d+)", href) or re.search(r"currentJobId=(\d+)", href)
-                    job_id = match.group(1) if match else None
+                    job_id = extract_job_id(href)
                 else:
                     job_id = job_id_attr
 
-                # 2. Check exclusion list
                 if job_id and job_id in excluded_ids:
                     print(f"[LinkedIn Engine] Skipping already applied Job ID: {job_id}")
                     continue
 
                 await card.scroll_into_view_if_needed()
                 await card.click()
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(2.5 + random.uniform(0, 1.5))
 
                 apply_btn = page.locator("button.jobs-apply-button, button[data-job-id]").first
                 if await apply_btn.count() and await apply_btn.is_visible():
@@ -511,8 +697,7 @@ async def search_and_prep_easy_apply(role: str, location: str = "United States",
                 continue
 
         if not target_job:
-            await context.storage_state(path=state_file)
-            await browser.close()
+            await _finalize_session(context, browser, state_file, trace_path)
             return {"error": "Could not find an accessible Easy Apply button on top listings."}
 
         max_steps = 7
@@ -524,16 +709,10 @@ async def search_and_prep_easy_apply(role: str, location: str = "United States",
         while step < max_steps:
             step += 1
             await asyncio.sleep(1.5)
-            
+
             await answer_common_questions(page)
 
-            file_input = page.locator("input[type='file']").first
-            if await file_input.count():
-                try:
-                    await file_input.set_input_files(resume_file)
-                    print("[LinkedIn Engine] Attached resume.pdf")
-                except Exception:
-                    pass
+            await attach_resume(page, resume_file)
 
             submit_btn = page.locator("button[aria-label='Submit application'], button:has-text('Submit application')").first
             review_btn = page.locator("button[aria-label='Review your application'], button:has-text('Review')").first
@@ -559,12 +738,10 @@ async def search_and_prep_easy_apply(role: str, location: str = "United States",
             await page.screenshot(path=screenshot_path)
             break
 
-        # Fallback guarantee: verify screenshot exists before continuing
         if not os.path.exists(screenshot_path):
             await page.screenshot(path=screenshot_path)
 
-        await context.storage_state(path=state_file)
-        await browser.close()
+        await _finalize_session(context, browser, state_file, trace_path)
 
         return {
             "success": True,

@@ -1,0 +1,26 @@
+{
+  "personal_info": {
+    "first_name": "Jane",
+    "last_name": "Doe",
+    "email": "jane.doe@example.com",
+    "phone": "555-0199"
+  },
+  "location": {
+    "city": "Atlanta",
+    "state": "GA",
+    "zip_code": "30301",
+    "country": "United States"
+  },
+  "legal_and_work_authorization": {
+    "authorized_in_us": "Yes",
+    "requires_sponsorship": "No",
+    "future_sponsorship": "No",
+    "at_least_18": "Yes"
+  },
+  "eeo_demographics": {
+    "gender": "Female",
+    "race_ethnicity": "Hispanic or Latino",
+    "veteran_status": "No",
+    "disability_status": "No"
+  }
+}

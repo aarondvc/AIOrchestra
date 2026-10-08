@@ -8,6 +8,7 @@ from typing import Literal, TypedDict
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
 from langgraph.graph import END, START, StateGraph
@@ -48,13 +49,20 @@ def extract_text(content) -> str:
         return "".join(text_parts).strip()
     return str(content).strip()
 
-# NOTE: verify this model string is valid for your Gemini API access before relying
-# on it in production; the form-evaluator LLM elsewhere in the codebase pins to
-# "gemini-3.6-flash", so keep these in sync unless you specifically need a newer model.
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
+# Primary model (Gemini)
+primary_llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
     google_api_key=os.getenv("GEMINI_API_KEY")
 )
+
+# Secondary model (Groq Llama 3.3 70B as free backup)
+fallback_llm = ChatGroq(
+    model_name="llama-3.3-70b-versatile",
+    groq_api_key=os.getenv("GROQ_API_KEY")
+)
+
+# Combine using with_fallbacks
+llm = primary_llm.with_fallbacks([fallback_llm])
 
 def orchestrator(state: AgentState):
     system_instruction = (
